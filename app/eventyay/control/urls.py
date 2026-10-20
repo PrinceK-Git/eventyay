@@ -24,6 +24,7 @@ from eventyay.control.views import (
     typeahead,
     user,
     users,
+    voucher_bulk,
     vouchers,
     waitinglist,
 )
@@ -367,6 +368,16 @@ urlpatterns = [
                     name='event.voucher.members',
                 ),
                 url(r'^vouchers/(?P<voucher>\d+)/$', vouchers.VoucherUpdate.as_view(), name='event.voucher'),
+                url(
+                    r'^vouchers/(?P<voucher>\d+)/group/edit$',
+                    voucher_bulk.VoucherBulkEdit.as_view(),
+                    name='event.voucher.group.edit',
+                ),
+                url(
+                    r'^vouchers/(?P<voucher>\d+)/group/delete$',
+                    voucher_bulk.VoucherGroupDelete.as_view(),
+                    name='event.voucher.group.delete',
+                ),
                 url(
                     r'^vouchers/(?P<voucher>\d+)/delete$', vouchers.VoucherDelete.as_view(), name='event.voucher.delete'
                 ),

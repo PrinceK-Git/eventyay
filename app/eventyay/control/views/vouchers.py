@@ -38,6 +38,7 @@ from eventyay.control.forms.vouchers import VoucherBulkForm, VoucherForm
 from eventyay.control.permissions import EventPermissionRequiredMixin
 from eventyay.control.signals import voucher_form_class
 from eventyay.control.views import PaginationMixin
+from eventyay.control.views.voucher_bulk import VoucherBulkEdit
 from eventyay.helpers.models import modelcopy
 
 
@@ -574,8 +575,13 @@ class VoucherBulkAction(EventPermissionRequiredMixin, View):
 
         return self.request.event.vouchers.filter(selected_vouchers).distinct()
 
-    @transaction.atomic
     def post(self, request, *args, **kwargs):
+        if request.POST.get('action') in ('edit', 'edit_preview', 'edit_confirm'):
+            return VoucherBulkEdit.as_view()(request, *args, **kwargs)
+        return self.delete_post(request, *args, **kwargs)
+
+    @transaction.atomic
+    def delete_post(self, request, *args, **kwargs):
         if not self.objects.exists():
             return redirect(self.get_success_url())
 

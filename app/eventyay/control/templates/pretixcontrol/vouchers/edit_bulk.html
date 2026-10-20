@@ -1,0 +1,43 @@
+{% extends 'pretixcontrol/event/base.html' %}
+{% load i18n bootstrap3 static compress %}
+{% block title %}{% trans 'Edit vouchers' %}{% endblock %}
+{% block content %}
+  <h1>{% if group %}{% blocktrans %}Edit group: {{ group }}{% endblocktrans %}{% else %}{% trans 'Edit selected vouchers' %}{% endif %}</h1>
+  <p>{% blocktrans count count=selected_count %}{{ count }} voucher selected.{% plural %}{{ count }} vouchers selected.{% endblocktrans %}</p>
+  <p>{% trans 'Select the fields to change. All other settings and voucher codes will be kept. Existing orders will not change.' %}</p>
+  <form method="post" class="form-horizontal" data-voucher-bulk-edit>
+    {% csrf_token %}
+    <input type="hidden" name="selection" value="{{ selection }}">
+    {% bootstrap_form_errors form %}
+    {{ form.fields_to_change.errors }}
+    {% for field in form.change_fields %}
+      <fieldset data-voucher-change-field>
+        <legend>
+          <label for="change_{{ field.name }}">
+            <input type="checkbox" id="change_{{ field.name }}" name="fields_to_change" value="{{ field.name }}"{% if field.name in form.fields_to_change.value %} checked{% endif %} data-voucher-change-toggle>
+            {% blocktrans with label=field.label %}Change {{ label }}{% endblocktrans %}
+          </label>
+        </legend>
+        {% bootstrap_field field layout='control' %}
+      </fieldset>
+    {% endfor %}
+    {% if preview %}
+      <div class="alert alert-info" data-voucher-preview aria-live="polite">
+        <p>{% blocktrans count count=updated_count %}{{ count }} voucher will be updated.{% plural %}{{ count }} vouchers will be updated.{% endblocktrans %}</p>
+        <p>{% blocktrans count count=skipped_count %}{{ count }} voucher will be skipped.{% plural %}{{ count }} vouchers will be skipped.{% endblocktrans %}</p>
+        <ul>{% for reason, count in skipped %}<li>{{ reason }}: {{ count }}</li>{% endfor %}</ul>
+      </div>
+      <input type="hidden" name="preview" value="{{ preview }}">
+    {% endif %}
+    <div class="form-group submit-group">
+      <a href="{% url 'control:event.vouchers' organizer=request.event.organizer.slug event=request.event.slug %}" class="btn btn-default">{% trans 'Cancel' %}</a>
+      <button type="submit" class="btn btn-default" name="action" value="edit_preview">{% trans 'Preview changes' %}</button>
+      {% if preview and updated_count %}
+        <button type="submit" class="btn btn-primary btn-save" name="action" value="edit_confirm" data-voucher-confirm>{% trans 'Save changes' %}</button>
+      {% endif %}
+    </div>
+  </form>
+  {% compress js %}
+    <script type="module" src="{% static 'pretixcontrol/js/ui/voucher-bulk-edit.js' %}"></script>
+  {% endcompress %}
+{% endblock %}

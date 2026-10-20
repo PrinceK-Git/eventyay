@@ -245,6 +245,9 @@ class Voucher(LoggedModel):
 
     objects = ScopedManager(organizer='event__organizer')
 
+    # Model forms validate before their pending many-to-many changes can be saved.
+    pending_product_limits = None
+
     class Meta:
         verbose_name = _('Voucher')
         verbose_name_plural = _('Vouchers')
@@ -283,6 +286,11 @@ class Voucher(LoggedModel):
         return self.redeemed == 0 and not self.orderposition_set.exists()
 
     def clean(self):
+        if self.pending_product_limits is not None:
+            limit_products, limit_variations = self.pending_product_limits
+        else:
+            limit_products = list(self.limit_products.all()) if self.pk else []
+            limit_variations = list(self.limit_variations.all()) if self.pk else []
         Voucher.clean_product_properties(
             {
                 'block_quota': self.block_quota,
@@ -292,8 +300,8 @@ class Voucher(LoggedModel):
             self.product,
             self.variation,
             seats_given=bool(self.seat),
-            limit_products=list(self.limit_products.all()) if self.pk else [],
-            limit_variations=list(self.limit_variations.all()) if self.pk else [],
+            limit_products=limit_products,
+            limit_variations=limit_variations,
         )
         Voucher.clean_value_and_budget(
             {

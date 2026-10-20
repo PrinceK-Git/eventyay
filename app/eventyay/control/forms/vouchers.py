@@ -110,6 +110,9 @@ class VoucherForm(I18nModelForm):
         }
 
     def __init__(self, *args, **kwargs):
+        self.check_quota = kwargs.pop('check_quota', True)
+        product_choices = kwargs.pop('product_choices', None)
+        has_seating = kwargs.pop('has_seating', None)
         instance = kwargs.get('instance')
         kwargs.setdefault('initial', {})
         initial = kwargs['initial']
@@ -157,23 +160,24 @@ class VoucherForm(I18nModelForm):
         elif 'subevent':
             del self.fields['subevent']
 
-        extra_products = []
-        if instance.pk:
-            extra_products.extend(instance.limit_products.all())
-            if instance.product_id:
-                extra_products.append(instance.product)
-        # Include products from initial productvar (e.g. bulk copy with pk=None).
-        for token in initial.get('productvar') or []:
-            token = str(token)
-            if not token or token == ALL_PRODUCTS or token.startswith('q-'):
-                continue
-            product_id = token.split('-', 1)[0]
-            try:
-                extra_products.append(instance.event.products.get(pk=product_id))
-            except (Product.DoesNotExist, ValueError):
-                continue
-        choices = build_productvar_choices(instance.event, extra_products=extra_products)
-        self.fields['productvar'].choices = choices
+        if product_choices is None:
+            extra_products = []
+            if instance.pk:
+                extra_products.extend(instance.limit_products.all())
+                if instance.product_id:
+                    extra_products.append(instance.product)
+            # Include products from initial productvar (e.g. bulk copy with pk=None).
+            for token in initial.get('productvar') or []:
+                token = str(token)
+                if not token or token == ALL_PRODUCTS or token.startswith('q-'):
+                    continue
+                product_id = token.split('-', 1)[0]
+                try:
+                    extra_products.append(instance.event.products.get(pk=product_id))
+                except (Product.DoesNotExist, ValueError):
+                    continue
+            product_choices = build_productvar_choices(instance.event, extra_products=extra_products)
+        self.fields['productvar'].choices = product_choices
         self.fields['productvar'].widget = MultipleProductVarQuotaWidget()
         self.fields['productvar'].required = False
         self.fields['productvar'].hide_optional = True
@@ -181,10 +185,12 @@ class VoucherForm(I18nModelForm):
         if 'valid_until' in self.fields:
             self.fields['valid_until'].hide_optional = True
 
-        if (
-            self.instance.event.seating_plan
-            or self.instance.event.subevents.filter(seating_plan__isnull=False).exists()
-        ):
+        if has_seating is None:
+            has_seating = bool(
+                self.instance.event.seating_plan
+                or self.instance.event.subevents.filter(seating_plan__isnull=False).exists()
+            )
+        if has_seating:
             self.fields['seat'] = forms.CharField(
                 label=_('Specific seat ID'),
                 max_length=255,
@@ -278,7 +284,7 @@ class VoucherForm(I18nModelForm):
             limit_products=getattr(self, '_limit_products', []),
             limit_variations=getattr(self, '_limit_variations', []),
         )
-        if not self.instance.show_hidden_products:
+        if not data.get('show_hidden_products'):
             limited = getattr(self, '_limit_products', []) or getattr(self, '_limit_variations', [])
             all_limits_hidden = bool(limited) and all(
                 i.hide_without_voucher for i in getattr(self, '_limit_products', [])
@@ -306,7 +312,7 @@ class VoucherForm(I18nModelForm):
             product_changed=data.get('productvar') != self.initial.get('productvar'),
             creating=not self.instance.pk,
         )
-        if check_quota:
+        if check_quota and self.check_quota:
             Voucher.clean_quota_check(
                 data,
                 cnt,
@@ -341,7 +347,11 @@ class VoucherForm(I18nModelForm):
         return data
 
     def _post_clean(self):
-        super()._post_clean()
+        self.instance.pending_product_limits = (self._limit_products, self._limit_variations)
+        try:
+            super()._post_clean()
+        finally:
+            self.instance.pending_product_limits = None
         for field, error_list in list(self._errors.items()):
             seen = set()
             unique_errors = []
@@ -369,6 +379,86 @@ class VoucherForm(I18nModelForm):
 
             self.save_m2m = save_m2m
         return instance
+
+
+class VoucherBulkEditForm(forms.Form):
+    fields_to_change = forms.MultipleChoiceField(
+        label=_('Fields to change'),
+        error_messages={'required': _('Select at least one field to change.')},
+    )
+
+    def __init__(self, *args, event, **kwargs):
+        super().__init__(*args, **kwargs)
+        prototype = VoucherForm(instance=Voucher(event=event, code=''))
+        self.product_choices = prototype.fields['productvar'].choices
+        self.has_seating = 'seat' in prototype.fields
+        editable_fields = {name: field for name, field in prototype.fields.items() if name not in ('code', 'seat')}
+        self.fields['fields_to_change'].choices = [(name, field.label) for name, field in editable_fields.items()]
+        self.fields.update(editable_fields)
+        self.order_fields(
+            [
+                'fields_to_change',
+                'max_usages',
+                'valid_until',
+                'productvar',
+                'price_mode',
+                'value',
+                'subevent',
+                'tag',
+                'block_quota',
+                'allow_ignore_quota',
+                'allow_ignore_approval',
+                'all_addons_included',
+                'all_bundles_included',
+                'budget',
+                'comment',
+                'show_hidden_products',
+            ]
+        )
+        selected = self.data.getlist('fields_to_change') if self.is_bound else []
+        for name, field in editable_fields.items():
+            if self.is_bound and name not in selected:
+                field.disabled = True
+                field.required = False
+                self.initial[name] = None
+
+    def change_fields(self):
+        return [self[name] for name in self.fields if name != 'fields_to_change']
+
+    def clean_value(self):
+        value = self.cleaned_data['value']
+        if value is not None and value < 0:
+            raise ValidationError(_('Voucher value cannot be negative.'))
+        return value
+
+    def clean_budget(self):
+        budget = self.cleaned_data['budget']
+        if budget is not None and budget < 0:
+            raise ValidationError(_('Voucher budget cannot be negative.'))
+        return budget
+
+    def voucher_form(self, voucher):
+        form = VoucherForm(
+            instance=voucher,
+            data=self.data,
+            check_quota=False,
+            product_choices=self.product_choices,
+            has_seating=self.has_seating,
+        )
+        for name, field in form.fields.items():
+            field.disabled = name not in self.cleaned_data['fields_to_change']
+        return form
+
+    def save_voucher(self, form):
+        voucher = form.save(commit=False)
+        fields = set(form.changed_data)
+        if 'productvar' in fields:
+            fields.remove('productvar')
+            fields.update(('product', 'variation', 'quota'))
+        voucher.save(update_fields=fields)
+        if 'productvar' in form.changed_data:
+            form.save_m2m()
+        return voucher
 
 
 class VoucherBulkForm(VoucherForm):

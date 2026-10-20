@@ -1,0 +1,16 @@
+{% extends 'pretixcontrol/event/base.html' %}
+{% load i18n %}
+{% block title %}{% trans 'Delete group' %}{% endblock %}
+{% block content %}
+  <h1>{% blocktrans %}Delete group: {{ group }}{% endblocktrans %}</h1>
+  <p>{% blocktrans count count=allowed_count %}{{ count }} unused voucher will be deleted.{% plural %}{{ count }} unused vouchers will be deleted.{% endblocktrans %}</p>
+  <p>{% blocktrans count count=kept_count %}{{ count }} used voucher will be kept.{% plural %}{{ count }} used vouchers will be kept.{% endblocktrans %}</p>
+  <form method="post">
+    {% csrf_token %}
+    <input type="hidden" name="selection" value="{{ selection }}">
+    <div class="form-group submit-group">
+      <a href="{% url 'control:event.vouchers' organizer=request.event.organizer.slug event=request.event.slug %}" class="btn btn-default">{% trans 'Cancel' %}</a>
+      <button type="submit" class="btn btn-delete btn-danger btn-save"{% if not allowed_count %} disabled{% endif %}>{% trans 'Delete group' %}</button>
+    </div>
+  </form>
+{% endblock %}
