@@ -6,7 +6,7 @@ from hashlib import sha256
 from django.contrib import messages
 from django.core import signing
 from django.db import transaction
-from django.db.models import Q
+from django.db.models import Model, Q, QuerySet
 from django.http import Http404, HttpResponseBadRequest
 from django.shortcuts import redirect, render
 from django.urls import reverse
@@ -17,6 +17,7 @@ from django_scopes import scope
 
 from eventyay.base.models import CartPosition, SubEvent, Voucher
 from eventyay.base.services.quotas import QuotaAvailability
+from eventyay.base.services.voucher_locking import VoucherLockLost, voucher_transaction
 from eventyay.control.forms.vouchers import VoucherBulkEditForm
 from eventyay.control.permissions import EventPermissionRequiredMixin
 from eventyay.helpers.json import CustomJSONEncoder
@@ -27,16 +28,18 @@ PREVIEW_SALT = 'voucher-bulk-preview'
 
 
 def preview_value(value):
+    """Canonicalize form values, including plugin model choices, for signed previews."""
     if isinstance(value, Decimal):
         return str(value.normalize())
-    if isinstance(value, list):
-        return sorted(value)
-    if isinstance(value, SubEvent):
+    if isinstance(value, (list, tuple, QuerySet)):
+        return sorted(preview_value(item) for item in value)
+    if isinstance(value, Model):
         return value.pk
     return value
 
 
 def selected_vouchers(request):
+    """Expand selected group representatives within the current event only."""
     try:
         ids = [int(pk) for pk in request.POST.getlist('voucher')]
         groups = [int(pk) for pk in request.POST.getlist('voucher_group')]
@@ -91,11 +94,12 @@ class VoucherQuotaBudget:
             )
 
     def reservations(self, data, redeemed):
+        """Normalize form initials (IDs) and cleaned dates (objects) before comparing quotas."""
         if not data.get('block_quota') or (data.get('valid_until') and data['valid_until'] < self.timestamp):
             return {}
         tokens = set(data['productvar'])
         subevent = data.get('subevent')
-        subevent_id = subevent.pk if subevent else None
+        subevent_id = subevent.pk if isinstance(subevent, SubEvent) else subevent
         return {
             quota: max(0, data['max_usages'] - redeemed)
             for quota in self.quotas
@@ -103,6 +107,7 @@ class VoucherQuotaBudget:
         }
 
     def accept(self, form):
+        """Reserve the net change, including reservations released earlier in this batch."""
         before = self.reservations(form.initial, form.instance.redeemed)
         after = self.reservations(form.cleaned_data, form.instance.redeemed)
         data = form.cleaned_data
@@ -159,6 +164,7 @@ class VoucherSelectionMixin:
         )
 
     def make_selection(self, vouchers, group=None):
+        """Freeze membership and bind the selection to the initiating user and event."""
         return signing.dumps(
             {
                 'event': self.request.event.pk,
@@ -171,12 +177,14 @@ class VoucherSelectionMixin:
         )
 
     def read_selection(self, token):
+        """Reject expired tokens and selections issued to another event or administrator."""
         selection = signing.loads(token, salt=SELECTION_SALT, max_age=3600)
         if selection['event'] != self.request.event.pk or selection['user'] != self.request.user.pk:
             raise signing.BadSignature('Invalid voucher selection.')
         return selection
 
     def group_selection(self):
+        """Capture current group members; later tag changes cannot expand this batch."""
         try:
             representative = self.request.event.vouchers.get(
                 pk=self.kwargs['voucher'],
@@ -219,6 +227,7 @@ class VoucherBulkEdit(VoucherSelectionMixin, EventPermissionRequiredMixin, View)
         )
 
     def plan(self, selection, form):
+        """Revalidate locked rows; preview and confirmation use the same eligibility rules."""
         vouchers = Voucher.annotate_budget_used_orders(
             self.queryset(selection)
             .select_for_update(of=('self',))
@@ -281,7 +290,7 @@ class VoucherBulkEdit(VoucherSelectionMixin, EventPermissionRequiredMixin, View)
                 form = VoucherBulkEditForm(request.POST, event=request.event)
                 if not form.is_valid():
                     return self.render_form(token, form)
-                with request.event.lock(), transaction.atomic():
+                with voucher_transaction(request.event) as guard:
                     updates, skipped, skipped_count = self.plan(selection, form)
                     state = {
                         'selection': token,
@@ -302,10 +311,15 @@ class VoucherBulkEdit(VoucherSelectionMixin, EventPermissionRequiredMixin, View)
                             )
                     if confirmed and updates:
                         for voucher_form in updates:
+                            guard.check()
                             changed = {name: voucher_form.cleaned_data[name] for name in voucher_form.changed_data}
                             voucher = form.save_voucher(voucher_form)
                             voucher.log_action('eventyay.voucher.changed', user=request.user, data=changed)
-                        messages.success(request, _('%(count)s vouchers have been updated.') % {'count': len(updates)})
+                        transaction.on_commit(
+                            lambda: messages.success(
+                                request, _('%(count)s vouchers have been updated.') % {'count': len(updates)}
+                            )
+                        )
                         return redirect(self.list_url())
                     return self.render_form(
                         token,
@@ -319,6 +333,9 @@ class VoucherBulkEdit(VoucherSelectionMixin, EventPermissionRequiredMixin, View)
                 return HttpResponseBadRequest(
                     _('This selection has expired or is invalid. Please select the vouchers again.')
                 )
+            except VoucherLockLost:
+                form.add_error(None, _('Exclusive access was lost. No changes were saved. Please preview again.'))
+                return self.render_form(token, form)
 
 
 class VoucherGroupDelete(VoucherSelectionMixin, EventPermissionRequiredMixin, View):
@@ -351,20 +368,31 @@ class VoucherGroupDelete(VoucherSelectionMixin, EventPermissionRequiredMixin, Vi
                 return HttpResponseBadRequest(
                     _('This selection has expired or is invalid. Please select the vouchers again.')
                 )
-            with request.event.lock(), transaction.atomic():
-                vouchers = self.queryset(selection).select_for_update(of=('self',))
-                deleted = 0
-                kept = 0
-                for voucher in vouchers:
-                    if not voucher.allow_delete():
-                        kept += 1
-                        continue
-                    voucher.log_action('eventyay.voucher.deleted', user=request.user)
-                    CartPosition.objects.filter(addon_to__voucher=voucher).delete()
-                    voucher.cartposition_set.all().delete()
-                    voucher.delete()
-                    deleted += 1
-                messages.success(
+            try:
+                return self.delete_selection(selection)
+            except VoucherLockLost:
+                messages.error(request, _('Exclusive access was lost. No vouchers were deleted. Please try again.'))
+                return self.confirmation(request.POST['selection'])
+
+    def delete_selection(self, selection):
+        """Recheck deletion eligibility under the same lock used by ticket bookings."""
+        request = self.request
+        with voucher_transaction(request.event) as guard:
+            vouchers = self.queryset(selection).select_for_update(of=('self',))
+            deleted = 0
+            kept = 0
+            for voucher in vouchers:
+                guard.check()
+                if not voucher.allow_delete():
+                    kept += 1
+                    continue
+                voucher.log_action('eventyay.voucher.deleted', user=request.user)
+                CartPosition.objects.filter(addon_to__voucher=voucher).delete()
+                voucher.cartposition_set.all().delete()
+                voucher.delete()
+                deleted += 1
+            transaction.on_commit(
+                lambda: messages.success(
                     request,
                     _('%(deleted)s vouchers deleted; %(kept)s used vouchers kept.')
                     % {
@@ -372,4 +400,5 @@ class VoucherGroupDelete(VoucherSelectionMixin, EventPermissionRequiredMixin, Vi
                         'kept': kept,
                     },
                 )
-            return redirect(self.list_url())
+            )
+        return redirect(self.list_url())

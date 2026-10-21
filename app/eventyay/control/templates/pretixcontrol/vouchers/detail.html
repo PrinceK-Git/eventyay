@@ -21,7 +21,11 @@
     {% endif %}
     <form action="" method="post" class="form-horizontal">
         {% csrf_token %}
+        {% if edit_revision %}<input type="hidden" name="edit_revision" value="{{ edit_revision }}">{% endif %}
         {% bootstrap_form_errors form %}
+        {% if edit_conflict %}
+            <p><a href="{{ request.path }}" target="_blank" rel="noopener">{% trans "Review current voucher in a new tab" %}</a></p>
+        {% endif %}
         <div class="row">
             <div class="col-xs-12 col-lg-10">
                 <fieldset>

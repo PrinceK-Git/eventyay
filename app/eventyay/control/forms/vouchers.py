@@ -17,7 +17,7 @@ from eventyay.base.forms import I18nModelForm, PlaceholderValidator
 from eventyay.base.models import Product, Voucher
 from eventyay.control.forms import SplitDateTimeField, SplitDateTimePickerWidget
 from eventyay.control.forms.widgets import MultipleProductVarQuotaWidget, Select2
-from eventyay.control.signals import voucher_form_validation
+from eventyay.control.signals import voucher_form_class, voucher_form_validation
 from eventyay.helpers.models import modelcopy
 
 
@@ -72,6 +72,8 @@ def build_productvar_choices(event, extra_products=None):
 
 
 class VoucherForm(I18nModelForm):
+    bulk_edit = False
+
     productvar = FakeMultipleChoiceField(
         label=_('Product'),
         help_text=_(
@@ -347,11 +349,21 @@ class VoucherForm(I18nModelForm):
         return data
 
     def _post_clean(self):
+        # Model validation must see the proposed product limits before M2M rows are saved.
         self.instance.pending_product_limits = (self._limit_products, self._limit_variations)
         try:
             super()._post_clean()
         finally:
             self.instance.pending_product_limits = None
+        if self.bulk_edit:
+            # Disabled fields still undergo cleaning (e.g. stripping whitespace or
+            # rounding dates). Restore them before plugin save hooks run.
+            for field in self.instance._meta.concrete_fields:
+                if field.name in self.fields and self.fields[field.name].disabled:
+                    setattr(self.instance, field.attname, getattr(self.initial_instance_data, field.attname))
+            if self.fields['productvar'].disabled:
+                for name in ('product_id', 'variation_id', 'quota_id'):
+                    setattr(self.instance, name, getattr(self.initial_instance_data, name))
         for field, error_list in list(self._errors.items()):
             seen = set()
             unique_errors = []
@@ -363,6 +375,8 @@ class VoucherForm(I18nModelForm):
             self._errors[field] = self.error_class(unique_errors, renderer=self.renderer)
 
     def _apply_product_limits(self, instance):
+        if self.bulk_edit and self.fields['productvar'].disabled:
+            return
         instance.limit_products.set(getattr(self, '_limit_products', []))
         instance.limit_variations.set(getattr(self, '_limit_variations', []))
 
@@ -382,6 +396,8 @@ class VoucherForm(I18nModelForm):
 
 
 class VoucherBulkEditForm(forms.Form):
+    """Apply only opted-in fields using the event's regular, plugin-aware voucher form."""
+
     fields_to_change = forms.MultipleChoiceField(
         label=_('Fields to change'),
         error_messages={'required': _('Select at least one field to change.')},
@@ -389,7 +405,11 @@ class VoucherBulkEditForm(forms.Form):
 
     def __init__(self, *args, event, **kwargs):
         super().__init__(*args, **kwargs)
-        prototype = VoucherForm(instance=Voucher(event=event, code=''))
+        self.voucher_form_class = VoucherForm
+        for receiver, response in voucher_form_class.send(event, cls=self.voucher_form_class):
+            if response:
+                self.voucher_form_class = response
+        prototype = self.voucher_form_class(instance=Voucher(event=event, code=''))
         self.product_choices = prototype.fields['productvar'].choices
         self.has_seating = 'seat' in prototype.fields
         editable_fields = {name: field for name, field in prototype.fields.items() if name not in ('code', 'seat')}
@@ -438,27 +458,22 @@ class VoucherBulkEditForm(forms.Form):
         return budget
 
     def voucher_form(self, voucher):
-        form = VoucherForm(
+        """Validate selected inputs against this voucher's current, unselected settings."""
+        form = self.voucher_form_class(
             instance=voucher,
             data=self.data,
             check_quota=False,
             product_choices=self.product_choices,
             has_seating=self.has_seating,
         )
+        form.bulk_edit = True
         for name, field in form.fields.items():
             field.disabled = name not in self.cleaned_data['fields_to_change']
         return form
 
     def save_voucher(self, form):
-        voucher = form.save(commit=False)
-        fields = set(form.changed_data)
-        if 'productvar' in fields:
-            fields.remove('productvar')
-            fields.update(('product', 'variation', 'quota'))
-        voucher.save(update_fields=fields)
-        if 'productvar' in form.changed_data:
-            form.save_m2m()
-        return voucher
+        """Run normal save hooks, including plugin-owned fields and related records."""
+        return form.save()
 
 
 class VoucherBulkForm(VoucherForm):

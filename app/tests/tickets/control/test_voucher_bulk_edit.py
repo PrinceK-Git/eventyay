@@ -2,9 +2,12 @@ import json
 from datetime import timedelta
 from decimal import Decimal
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import pytest
 from bs4 import BeautifulSoup
+from django import forms
+from django.core import signing
 from django.urls import reverse
 from django.utils.timezone import now
 from django_scopes import scope
@@ -25,6 +28,9 @@ from eventyay.base.models import (
     Voucher,
     WaitingListEntry,
 )
+from eventyay.base.services.voucher_locking import VoucherLockGuard, VoucherLockLost
+from eventyay.control.forms.vouchers import VoucherForm
+from eventyay.control.signals import voucher_form_class
 from eventyay.control.views.voucher_bulk import VoucherQuotaBudget
 
 
@@ -50,6 +56,17 @@ def env(client, settings):
 
 def voucher(env, **kwargs):
     return Voucher.objects.create(event=env.event, tag='Group', **kwargs)
+
+
+def edit_page(client, env, obj):
+    """Submit the same ordinary edit form an administrator received on GET."""
+    target = url(env, 'voucher', obj)
+    response = client.get(target)
+    form = response.context['form']
+    data = {name: value for name, value in form.initial.items() if value is not None}
+    data['edit_revision'] = response.context['edit_revision']
+    data.pop('valid_until', None)
+    return target, data
 
 
 def url(env, action, obj=None):
@@ -647,3 +664,186 @@ def test_every_product_requires_quota_when_reserving_multiple_products(client, e
     )
     assert response.context['updated_count'] == 0
     assert dict(response.context['skipped']) == {'Not enough quota available': 1}
+
+
+@pytest.mark.parametrize('change_date', [False, True])
+def test_edit_existing_dated_reservation(client, env, change_date):
+    env.event.has_subevents = True
+    env.event.save()
+    old_date = SubEvent.objects.create(event=env.event, name='First day', date_from=now())
+    env.quota.subevent = old_date
+    env.quota.save()
+    obj = voucher(env, product=env.product, subevent=old_date, block_quota=True, max_usages=3)
+    changes = {'comment': 'Updated'}
+    expected_date = old_date
+    if change_date:
+        expected_date = SubEvent.objects.create(event=env.event, name='Second day', date_from=now())
+        new_quota = Quota.objects.create(event=env.event, name='Second quota', size=3, subevent=expected_date)
+        new_quota.products.add(env.product)
+        changes['subevent'] = str(expected_date.pk)
+    target, data, response = preview(client, env, obj, changes)
+    assert response.context['updated_count'] == 1
+    assert confirm(client, target, data, response).status_code == 302
+    obj.refresh_from_db()
+    assert obj.subevent == expected_date
+    assert obj.comment == 'Updated'
+
+
+@pytest.fixture
+def plugin_form(monkeypatch):
+    class PluginVoucherForm(VoucherForm):
+        reference = forms.CharField(required=False, label='Plugin reference')
+
+        def clean_reference(self):
+            value = self.cleaned_data['reference']
+            if value == 'invalid':
+                raise forms.ValidationError('Invalid plugin reference')
+            return value
+
+        def clean(self):
+            data = super().clean()
+            if (data.get('value') or 0) > 50:
+                raise forms.ValidationError('Plugin discount limit exceeded')
+            return data
+
+        def save(self, commit=True):
+            result = super().save(commit=commit)
+            if commit and 'reference' in self.changed_data:
+                result.log_action('test.plugin.reference', data={'reference': self.cleaned_data['reference']})
+            return result
+
+    monkeypatch.setattr(voucher_form_class, 'send', lambda *args, **kwargs: [(None, PluginVoucherForm)])
+
+
+def test_bulk_plugin_field_validation_and_save(client, env, plugin_form):
+    obj = voucher(env)
+    target, data, response = preview(client, env, obj, {'reference': 'invalid'})
+    assert response.context['updated_count'] == 0
+    assert 'Invalid plugin reference' in dict(response.context['skipped'])
+    target, data, response = preview(client, env, obj, {'reference': 'REF-123'})
+    assert response.context['updated_count'] == 1
+    assert not LogEntry.objects.filter(action_type='test.plugin.reference').exists()
+    assert confirm(client, target, data, response).status_code == 302
+    log = LogEntry.objects.get(action_type='test.plugin.reference')
+    assert json.loads(log.data) == {'reference': 'REF-123'}
+
+
+def test_bulk_plugin_cross_field_validation(client, env, plugin_form):
+    obj = voucher(env)
+    target, data, response = preview(client, env, obj, {'value': '60'})
+    assert response.context['updated_count'] == 0
+    assert 'Plugin discount limit exceeded' in dict(response.context['skipped'])
+
+
+@pytest.mark.parametrize('change', ['bulk', 'ordinary', 'queryset', 'products', 'redemption'])
+def test_stale_edit_keeps_inputs_and_never_refreshes_token(client, env, change):
+    obj = voucher(env)
+    target, data = edit_page(client, env, obj)
+    if change == 'bulk':
+        batch_target, batch_data, response = preview(client, env, obj, {'value': '25'})
+        assert confirm(client, batch_target, batch_data, response).status_code == 302
+    elif change == 'ordinary':
+        other_target, other_data = edit_page(client, env, obj)
+        assert client.post(other_target, {**other_data, 'value': '25'}).status_code == 302
+    elif change == 'queryset':
+        Voucher.objects.filter(pk=obj.pk).update(value=25)
+    elif change == 'products':
+        obj.limit_products.add(env.product)
+    else:
+        Voucher.objects.filter(pk=obj.pk).update(redeemed=1)
+    data['comment'] = 'My unsaved work'
+    for attempt in range(2):
+        response = client.post(target, data)
+        assert response.status_code == 200
+        assert response.context['edit_conflict']
+        assert response.context['form']['comment'].value() == 'My unsaved work'
+        assert response.context['edit_revision'] == data['edit_revision']
+        assert b'Review current voucher in a new tab' in response.content
+    obj.refresh_from_db()
+    assert obj.comment == ''
+    if change in ('bulk', 'ordinary', 'queryset'):
+        assert obj.value == 25
+    elif change == 'products':
+        assert obj.limit_products.filter(pk=env.product.pk).exists()
+    else:
+        assert obj.redeemed == 1
+
+
+def test_opening_another_edit_page_does_not_invalidate_save(client, env):
+    obj = voucher(env)
+    target, data = edit_page(client, env, obj)
+    edit_page(client, env, obj)
+    assert client.post(target, {**data, 'comment': 'Saved'}).status_code == 302
+    obj.refresh_from_db()
+    assert obj.comment == 'Saved'
+
+
+@pytest.mark.parametrize('token_kind', ['missing', 'tampered', 'other_voucher', 'expired'])
+def test_edit_revision_cannot_be_bypassed(client, env, token_kind):
+    obj = voucher(env)
+    target, data = edit_page(client, env, obj)
+    if token_kind == 'missing':
+        data.pop('edit_revision')
+    elif token_kind == 'tampered':
+        data['edit_revision'] += 'broken'
+    elif token_kind == 'other_voucher':
+        _, other_data = edit_page(client, env, voucher(env))
+        data['edit_revision'] = other_data['edit_revision']
+    else:
+        # Correctly signed but older than the edit session's one-day lifetime.
+        with patch('django.core.signing.time.time', return_value=0):
+            data['edit_revision'] = signing.dumps(
+                signing.loads(data['edit_revision'], salt='voucher-edit-revision'), salt='voucher-edit-revision'
+            )
+    response = client.post(target, {**data, 'comment': 'Must not save'})
+    assert response.status_code == 200
+    assert response.context['edit_conflict']
+    obj.refresh_from_db()
+    assert obj.comment == ''
+
+
+@pytest.mark.parametrize('operation', ['edit', 'delete'])
+@pytest.mark.parametrize('loss_at', [2, 3])
+def test_lock_loss_rolls_back_entire_batch(client, env, monkeypatch, operation, loss_at):
+    first = voucher(env)
+    second = voucher(env)
+    if operation == 'edit':
+        target, data, response = preview(client, env, first, {'comment': 'Must roll back'})
+    else:
+        target = url(env, 'voucher.group.delete', first)
+        data = {'selection': selection(client.get(target))}
+    calls = 0
+
+    def lose_after_first(guard):
+        nonlocal calls
+        calls += 1
+        if calls == loss_at:
+            raise VoucherLockLost()
+
+    monkeypatch.setattr(VoucherLockGuard, 'check', lose_after_first)
+    response = confirm(client, target, data, response) if operation == 'edit' else client.post(target, data)
+    assert response.status_code == 200
+    for obj in (first, second):
+        obj.refresh_from_db()
+        assert obj.comment == ''
+    assert not LogEntry.objects.filter(
+        action_type__in=['eventyay.voucher.changed', 'eventyay.voucher.deleted']
+    ).exists()
+    assert b'Exclusive access was lost' in response.content
+
+
+@pytest.mark.parametrize('stage', ['start', 'check'])
+def test_lock_loss_keeps_ordinary_edit_inputs(client, env, monkeypatch, stage):
+    obj = voucher(env)
+    target, data = edit_page(client, env, obj)
+
+    def lose(guard):
+        raise VoucherLockLost()
+
+    monkeypatch.setattr(VoucherLockGuard, stage, lose)
+    response = client.post(target, {**data, 'comment': 'Unsaved input'})
+    assert response.status_code == 200
+    assert response.context['form']['comment'].value() == 'Unsaved input'
+    obj.refresh_from_db()
+    assert obj.comment == ''
+    assert not LogEntry.objects.filter(action_type='eventyay.voucher.changed').exists()

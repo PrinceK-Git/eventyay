@@ -185,6 +185,12 @@ an asynchronous context. For the bulk creation form, ``save()`` is not called. I
 you can implement ``post_bulk_save(saved_vouchers)`` which may be called multiple times
 for every batch persisted to the database.
 
+Bulk editing also uses this form class, validating and calling ``save()`` separately
+for each eligible voucher. Fields the administrator has not selected are disabled
+and keep their existing values. Saves run inside the batch transaction; schedule
+external side effects with ``transaction.on_commit()`` so a failed batch does not
+send notifications or make external changes for rolled-back vouchers.
+
 As with all plugin signals, the ``sender`` keyword argument will contain the event.
 """
 

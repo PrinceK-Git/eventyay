@@ -1,8 +1,11 @@
 import io
+import json
+from hashlib import sha256
 
 from defusedcsv import csv
 from django.conf import settings
 from django.contrib import messages
+from django.core import signing
 from django.core.exceptions import ValidationError
 from django.db import connection, transaction
 from django.db.models import Min, Q, Subquery, Sum
@@ -27,10 +30,12 @@ from django.views.generic import (
     UpdateView,
     View,
 )
+from django_scopes import scope
 
 from eventyay.base.models import CartPosition, LogEntry, OrderPosition, Voucher
 from eventyay.base.models.vouchers import _generate_random_code
 from eventyay.base.services.locking import NoLockManager
+from eventyay.base.services.voucher_locking import VoucherLockLost, voucher_transaction
 from eventyay.base.services.vouchers import vouchers_send
 from eventyay.base.views.tasks import AsyncFormView
 from eventyay.control.forms.filter import VoucherFilterForm, advanced_filter_count, advanced_filters_open_from_get
@@ -273,6 +278,44 @@ class VoucherUpdate(EventPermissionRequiredMixin, UpdateView):
     template_name = 'pretixcontrol/vouchers/detail.html'
     permission = 'can_change_vouchers'
     context_object_name = 'voucher'
+    edit_conflict = False
+
+    def revision(self, voucher):
+        """Fingerprint saved values, including updates made outside model save hooks."""
+        state = {field.name: field.value_to_string(voucher) for field in voucher._meta.concrete_fields}
+        state['limit_products'] = list(voucher.limit_products.order_by('pk').values_list('pk', flat=True))
+        state['limit_variations'] = list(voucher.limit_variations.order_by('pk').values_list('pk', flat=True))
+        return {
+            'voucher': voucher.pk,
+            'event': self.request.event.pk,
+            'user': self.request.user.pk,
+            'state': sha256(json.dumps(state, sort_keys=True).encode()).hexdigest(),
+        }
+
+    def get_context_data(self, **kwargs):
+        context = super().get_context_data(**kwargs)
+        # Never refresh a rejected POST's token: retrying it must not overwrite newer work.
+        context['edit_revision'] = (
+            self.request.POST.get('edit_revision', '')
+            if self.request.method == 'POST'
+            else signing.dumps(self.current_revision, salt='voucher-edit-revision')
+        )
+        context['edit_conflict'] = self.edit_conflict
+        return context
+
+    def post(self, request, *args, **kwargs):
+        # Lock before binding the form, so comparison and saving use the same database state.
+        with scope(event=request.event):
+            try:
+                with voucher_transaction(request.event):
+                    return super().post(request, *args, **kwargs)
+            except VoucherLockLost:
+                with transaction.atomic():
+                    self.object = self.get_object()
+                    form = self.get_form()
+                    form.is_valid()
+                    form.add_error(None, _('Exclusive access was lost. No changes were saved. Please try again.'))
+                    return self.form_invalid(form)
 
     def get_form_class(self):
         form_class = VoucherForm
@@ -281,16 +324,38 @@ class VoucherUpdate(EventPermissionRequiredMixin, UpdateView):
                 form_class = response
         return form_class
 
-    def get_object(self, queryset=None) -> VoucherForm:
+    def get_object(self, queryset=None) -> Voucher:
         url = resolve(self.request.path_info)
         try:
-            return self.request.event.vouchers.get(id=url.kwargs['voucher'])
+            queryset = self.request.event.vouchers.all()
+            if self.request.method == 'POST':
+                queryset = queryset.select_for_update()
+            voucher = queryset.get(id=url.kwargs['voucher'])
+            self.current_revision = self.revision(voucher)
+            return voucher
         except Voucher.DoesNotExist:
             raise Http404(_('The requested voucher does not exist.'))
 
     @transaction.atomic
     def form_valid(self, form):
-        messages.success(self.request, _('Your changes have been saved.'))
+        try:
+            previous = signing.loads(
+                self.request.POST.get('edit_revision', ''), salt='voucher-edit-revision', max_age=86400
+            )
+        except signing.BadSignature:
+            previous = None
+        if previous != self.current_revision:
+            self.edit_conflict = True
+            form.add_error(
+                None,
+                _(
+                    'This voucher has changed since you opened it, or your editing session has expired. '
+                    'Your entered values are still shown below. Review the current voucher in a new tab '
+                    'and apply your changes there.'
+                ),
+            )
+            return self.form_invalid(form)
+        transaction.on_commit(lambda: messages.success(self.request, _('Your changes have been saved.')))
         if form.has_changed():
             self.object.log_action(
                 'eventyay.voucher.changed',
